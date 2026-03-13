@@ -42,6 +42,14 @@ chroma_data/
 # Temporary files
 create_demo.py
 DEPLOYMENT_NOTES.md
+test_output.txt
+temp_req.txt
+verify_db_real.py
+
+# Database
+sql_app.db
+*.db
+*.sqlite
 
 # OpenClaw/ClawBot related files
 openclaw_skill/

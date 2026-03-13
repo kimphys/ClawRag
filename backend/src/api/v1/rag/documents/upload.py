@@ -96,11 +96,24 @@ def validate_file_type(file_path: str, claimed_extension: str) -> bool:
         text_extensions = ['.md', '.csv', '.html']
         if claimed_extension.lower() in text_extensions:
             # Check if file is mostly ASCII/UTF-8 printable
+            # FIX ISSUE #7: Handle potential truncation of multi-byte characters at 512-byte boundary
+            # Text files should not contain null bytes (\x00), which is a common indicator for binary files.
+            if b'\x00' in header:
+                logger.warning(f"File {file_path} claims to be {claimed_extension} but contains binary data (null bytes)")
+                return False
+                
             try:
-                header.decode('utf-8')
+                # Try decoding with 'ignore' for the very end to avoid truncation errors
+                # but ensure the result is generally valid text.
+                header.decode('utf-8', errors='strict')
                 return True
-            except UnicodeDecodeError:
-                logger.warning(f"File {file_path} claims to be {claimed_extension} but contains binary data")
+            except UnicodeDecodeError as e:
+                # If it's a truncation error at the end of our 512-byte buffer, it's valid.
+                # A UTF-8 character can be up to 4 bytes. 
+                # If the error starts near the end (last 3 bytes), it's likely truncation.
+                if e.start >= len(header) - 3:
+                    return True
+                logger.warning(f"File {file_path} claims to be {claimed_extension} but contains invalid characters or binary data")
                 return False
 
         # Binary files: check magic bytes
