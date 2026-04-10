@@ -55,6 +55,10 @@ class IngestFolderRequest(BaseModel):
     profile: str = Field("default", description="Ingestion profile (codebase, documents, default)")
     recursive: bool = Field(True, description="Whether to scan recursively")
     allowed_extensions: Optional[List[str]] = Field(None, description="Specific extensions to include")
+    default_chunking_strategy: Optional[str] = Field("sentence", description="Chunking strategy to use")
+    incremental: bool = Field(True, description="Skip unchanged files")
+    clean_sync: bool = Field(False, description="Remove documents from DB if file is deleted from folder")
+    target_file: Optional[str] = Field(None, description="Specific file name to target inside the folder")
 
 async def _process_files_background(
     task_id: str,
@@ -62,172 +66,78 @@ async def _process_files_background(
     request: IngestFolderRequest,
     rag_client
 ):
-    """Background task to process files and update task status."""
+    """Background task to process files via generic IngestionProcessor and handle sync options."""
+    from src.api.v1.rag.models.ingestion import ProcessOptions, ChunkingStrategy
+    from src.services.ingestion_task_manager import ingestion_task_manager, TaskStatus
+    import traceback
+    
+    processor = ingestion_task_manager.get_processor()
     task = ingestion_task_manager.get_task(task_id)
-    if not task:
-        logger.error(f"Task {task_id} not found")
-        return
 
-    task.status = TaskStatus.PROCESSING
-    task.started_at = datetime.now()
+    try:
+        if not task:
+            logger.error(f"Task {task_id} not found")
+            return
 
-    successful = 0
-    failed = 0
-
-    for idx, file_path in enumerate(files_to_ingest, 1):
-        try:
-            logger.info(f"[{idx}/{len(files_to_ingest)}] Processing: {file_path}")
-            filename = os.path.basename(file_path)
-            ext = Path(file_path).suffix.lower()
-            start_time = datetime.now()
-
-            # Determine processing method based on file type
-            if docling_service.is_supported_file(file_path):
-                # Documents: Use Docling Service
-                process_result = await docling_service.process_file(file_path)
-
-                if not process_result["success"]:
-                    failed += 1
-                    task.file_results.append(FileResult(
-                        file_path=file_path,
-                        filename=filename,
-                        success=False,
-                        error=process_result.get("error", "Docling processing failed"),
-                        processing_time=(datetime.now() - start_time).total_seconds()
-                    ))
-                    task.processed_files = idx
-                    task.failed_files = failed
-                    continue
-
-                markdown_content = process_result["content"]
-                doc_metadata = process_result["metadata"]
-            else:
-                # Code files: Read as plain text
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        markdown_content = f.read()
-                    doc_metadata = {
-                        "title": filename,
-                        "file_type": ext,
-                        "size": os.path.getsize(file_path)
-                    }
-                except UnicodeDecodeError:
-                    # Try with different encoding for non-UTF8 files
-                    with open(file_path, 'r', encoding='latin-1') as f:
-                        markdown_content = f.read()
-                    doc_metadata = {
-                        "title": filename,
-                        "file_type": ext,
-                        "size": os.path.getsize(file_path),
-                        "encoding": "latin-1"
-                    }
-
-            # Add ingestion metadata
-            doc_metadata.update({
-                'source': filename,
-                'file_type': ext,
-                'collection': request.collection_name,
-                'processed_by': 'docling_service_v1'
-            })
-
-            # Use LlamaIndex SentenceSplitter
-            text_splitter = SentenceSplitter(
-                chunk_size=512,
-                chunk_overlap=50
-            )
-
-            llama_doc = LlamaDocument(
-                text=markdown_content,
-                metadata=doc_metadata
-            )
-
-            # Split content
-            nodes = text_splitter.get_nodes_from_documents([llama_doc])
-
-            # Get or create collection
+        # 1. CLEAN SYNC: Remove documents not in the folder anymore
+        if request.clean_sync:
+            logger.info(f"Task {task_id}: Performing clean sync for collection {request.collection_name}")
             try:
-                collection = await asyncio.to_thread(
-                    rag_client.chroma_manager.get_collection,
-                    request.collection_name
-                )
-            except Exception:
-                response = await rag_client.create_collection(name=request.collection_name)
-                if not response.is_success:
-                    raise Exception(f"Failed to create collection: {response.error}")
-                collection = await asyncio.to_thread(
-                    rag_client.chroma_manager.get_collection,
-                    request.collection_name
-                )
+                # get_collection will throw error if not exists, which is fine, means no clean sync needed
+                actual_client = rag_client.chroma_manager.chroma_client.get_client() if hasattr(rag_client.chroma_manager.chroma_client, 'get_client') else rag_client.chroma_manager.chroma_client
+                collection = await asyncio.to_thread(actual_client.get_collection, request.collection_name)
+                
+                # We need all documents in this collection
+                all_data = await asyncio.to_thread(collection.get, include=["metadatas"])
+                ids_to_delete = []
+                valid_filenames = {os.path.basename(f) for f in files_to_ingest}
+                
+                for doc_id, metadata in zip(all_data["ids"], all_data["metadatas"]):
+                    if doc_id == "__collection_metadata__":
+                        continue
+                    
+                    # Usually "source" or "file_name" holds the filename
+                    source_name = metadata.get("source") or metadata.get("file_name") or ""
+                    # For chunks, the id might be filename_chunkindex
+                    # Just check if source_name is still valid
+                    if source_name and source_name not in valid_filenames:
+                        ids_to_delete.append(doc_id)
+                
+                if ids_to_delete:
+                    await asyncio.to_thread(collection.delete, ids=ids_to_delete)
+                    logger.info(f"Clean Sync: Removed {len(ids_to_delete)} chunks/documents belonging to deleted files.")
+            except Exception as e:
+                logger.warning(f"Skipping clean sync (collection might not exist yet or error): {e}")
 
-            # Prepare for ChromaDB
-            texts = [node.text for node in nodes]
-            metadatas = [flatten_metadata(node.metadata) for node in nodes]
-            ids = [f"{filename}_{i}_{os.urandom(4).hex()}" for i in range(len(nodes))]
-
-            # Generate Embeddings
-            embedding_instance = rag_client.embedding_manager.get_embeddings()
-            if not embedding_instance:
-                raise Exception("Failed to initialize embeddings")
-
-            if hasattr(embedding_instance, 'aget_text_embedding_batch'):
-                embeddings = await embedding_instance.aget_text_embedding_batch(texts)
-            elif hasattr(embedding_instance, 'get_text_embedding_batch'):
-                embeddings = await asyncio.to_thread(embedding_instance.get_text_embedding_batch, texts)
-            elif hasattr(embedding_instance, 'aembed_documents'):
-                embeddings = await embedding_instance.aembed_documents(texts)
-            elif hasattr(embedding_instance, 'embed_documents'):
-                embeddings = await asyncio.to_thread(embedding_instance.embed_documents, texts)
-            else:
-                raise Exception("Embedding instance has no compatible embed method")
-
-            # Add to ChromaDB
-            await asyncio.to_thread(collection.add,
-                documents=texts,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                ids=ids
-            )
-
-            chunk_count = len(nodes)
-            successful += 1
-            task.file_results.append(FileResult(
-                file_path=file_path,
-                filename=filename,
-                success=True,
-                chunks=chunk_count,
-                processing_time=(datetime.now() - start_time).total_seconds()
-            ))
-
-            # Update task progress
-            task.processed_files = idx
-            task.successful_files = successful
-            task.total_chunks += chunk_count
-
-            logger.info(f"✓ [{idx}/{len(files_to_ingest)}] '{filename}': {chunk_count} chunks")
-
-        except Exception as e:
-            failed += 1
-            logger.error(f"✗ [{idx}/{len(files_to_ingest)}] Failed to process {file_path}: {e}")
-            task.file_results.append(FileResult(
-                file_path=file_path,
-                filename=os.path.basename(file_path),
-                success=False,
-                error=str(e),
-                processing_time=(datetime.now() - start_time).total_seconds()
-            ))
-            task.processed_files = idx
-            task.failed_files = failed
-
-    # Mark task as complete
-    task.completed_at = datetime.now()
-    if failed == 0:
-        task.status = TaskStatus.SUCCESS
-    elif successful == 0:
-        task.status = TaskStatus.FAILED
-    else:
-        task.status = TaskStatus.PARTIAL
-
-    logger.info(f"Task {task_id} completed: {successful} successful, {failed} failed")
+        # 2. Prepare assignments
+        assignments = []
+        chunking_strategy = ChunkingStrategy(request.default_chunking_strategy) if request.default_chunking_strategy else ChunkingStrategy.SENTENCE
+        # If incremental is False, we force re-ingest (skip hash check)
+        process_options = ProcessOptions(
+            chunking_strategy=chunking_strategy,
+            force_reingest=not request.incremental
+        )
+        
+        for file_path in files_to_ingest:
+            assignments.append({
+                "file_path": file_path,
+                "filename": os.path.basename(file_path),
+                "collection": request.collection_name,
+                "process_options": process_options
+            })
+            
+        task.assignments = assignments
+        
+        # 3. Call processor
+        # It handles duplicate skipping natively if ExtractionService with DuplicateDetector is used
+        await processor.process_task_async(task_id, rag_client)
+        
+    except Exception as e:
+        logger.error(f"Background task failed: {e}\n{traceback.format_exc()}")
+        if task:
+            task.status = TaskStatus.FAILED
+            task.error_message = str(e)
+            task.completed_at = datetime.now()
 
 
 @router.post("/ingest-folder")
@@ -270,6 +180,10 @@ async def ingest_folder_endpoint(
         dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "node_modules", "venv", ".venv", "dist", "build"}]
 
         for filename in filenames:
+            # Filter by target_file if specified
+            if request.target_file and filename != request.target_file:
+                continue
+                
             ext = os.path.splitext(filename)[1].lower()
             # Only filter by extension list (includes both documents and code files)
             if ext in extensions:

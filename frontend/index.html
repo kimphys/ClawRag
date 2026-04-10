@@ -623,7 +623,7 @@
             <div class="card">
                 <div class="card-title">Folder Ingestion</div>
                 <div id="ingest-alert"></div>
-                <div class="form-group">
+                <div class="form-group" style="margin-bottom: 24px;">
                     <label>Folder Path</label>
                     <div style="display: flex; gap: 8px;">
                         <input type="text" id="ingest-path" value="/host_root"
@@ -633,6 +633,14 @@
                     </div>
                     <small style="color: var(--text-secondary); font-size: 12px; margin-top: 4px; display: block;">
                         💡 Path points to the mounted folder configured in .env (DOCS_DIR). Use /host_root or subdirectories like /host_root/subfolder
+                    </small>
+                </div>
+
+                <div class="form-group" style="margin-bottom: 24px;">
+                    <label>Target File <span style="font-weight: normal; color: var(--text-secondary);">(Optional)</span></label>
+                    <input type="text" id="ingest-target-file" placeholder="e.g. 2026-04-07-16-11-29-7552192e.md" style="width: 100%;">
+                    <small style="color: var(--text-secondary); font-size: 12px; margin-top: 4px; display: block;">
+                        💡 Leave empty to process all files in the folder. Specify a filename to process ONLY that specific file.
                     </small>
                 </div>
 
@@ -652,7 +660,12 @@
                 <div class="grid-2">
                     <div class="form-group">
                         <label>Collection Name</label>
-                        <input type="text" id="ingest-collection" placeholder="my_docs">
+                        <div style="display: flex; gap: 8px;">
+                            <input type="text" id="ingest-collection" placeholder="Type new or select existing" style="flex: 1;">
+                            <select id="ingest-collection-select" onchange="if(this.value) { document.getElementById('ingest-collection').value = this.value; this.value = ''; }" style="width: auto;">
+                                <option value="">🔽 Select Existing</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>Profile</label>
@@ -678,6 +691,20 @@
                     </div>
                 </div>
 
+                <div class="card" style="background: var(--bg-tertiary); margin: 16px 0;">
+                    <div class="card-title" style="font-size: 14px; margin-bottom: 12px;">🔄 Sync Options</div>
+                    <div style="display: flex; flex-direction: column; gap: 8px;">
+                        <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer; margin-bottom: 0;">
+                            <input type="checkbox" id="ingest-incremental" checked style="width: auto;">
+                            <span><strong>Incremental Sync</strong> (Skip unchanged files automatically)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer; margin-bottom: 0;">
+                            <input type="checkbox" id="ingest-clean-sync" style="width: auto;">
+                            <span><strong style="color: var(--error);">Clean Sync</strong> (Remove documents from DB if file is deleted from folder)</span>
+                        </label>
+                    </div>
+                </div>
+
                 <div style="display: flex; gap: 12px;">
                     <button onclick="startIngestion()" style="flex: 1;">Start Ingestion</button>
                 </div>
@@ -687,6 +714,8 @@
                         <div id="ingest-progress-fill" class="progress-fill" style="width: 0%"></div>
                     </div>
                     <p id="ingest-status" style="color: var(--text-secondary); font-size: 13px; margin-top: 8px;"></p>
+                    <div id="ingest-failed-files" style="display: none; margin-top: 12px; max-height: 150px; overflow-y: auto; font-size: 12px; background: var(--bg-secondary); border-radius: 4px; border: 1px solid var(--error-hover); padding: 8px;">
+                    </div>
                 </div>
             </div>
         </div>
@@ -723,7 +752,7 @@
                 startLogPolling();
             }
             if (tabName === 'collections') loadCollections();
-            if (tabName === 'query' || tabName === 'search' || tabName === 'upload') loadCollectionsList();
+            if (tabName === 'query' || tabName === 'search' || tabName === 'upload' || tabName === 'ingest') loadCollectionsList();
         }
 
         // Live Log Polling
@@ -847,7 +876,7 @@
         }
 
         async function loadCollectionsList() {
-            const selects = ['query-collection', 'search-collection', 'upload-collection'];
+            const selects = ['query-collection', 'search-collection', 'upload-collection', 'ingest-collection-select'];
 
             try {
                 const res = await fetch(`${API_URL}/collections`);
@@ -857,12 +886,16 @@
                     const select = document.getElementById(id);
                     if (!select) return;
 
+                    const isIngest = id === 'ingest-collection-select';
+                    const placeholder = isIngest ? '<option value="">🔽 Select Existing</option>' : '<option value="">No collections available</option>';
+
                     if (!data.collections || data.collections.length === 0) {
-                        select.innerHTML = '<option value="">No collections available</option>';
+                        select.innerHTML = placeholder;
                     } else {
-                        select.innerHTML = data.collections.map(col =>
+                        const options = data.collections.map(col =>
                             `<option value="${col.name}">${col.name}</option>`
                         ).join('');
+                        select.innerHTML = isIngest ? placeholder + options : options;
                     }
                 });
             } catch (error) {
@@ -1226,10 +1259,14 @@
         // Ingestion
         async function startIngestion() {
             let path = document.getElementById('ingest-path').value.trim();
+            const targetFile = document.getElementById('ingest-target-file').value.trim();
             const collection = document.getElementById('ingest-collection').value.trim();
             const profile = document.getElementById('ingest-profile').value;
             const strategy = document.getElementById('ingest-strategy').value;
             const threshold = document.getElementById('ingest-semantic-threshold').value;
+            
+            const incremental = document.getElementById('ingest-incremental').checked;
+            const cleanSync = document.getElementById('ingest-clean-sync').checked;
 
             if (!path || !collection) {
                 showAlert('ingest-alert', 'Please fill in all fields', 'error');
@@ -1256,8 +1293,14 @@
                 collection_name: collection,
                 profile: profile,
                 recursive: true,
-                default_chunking_strategy: strategy
+                default_chunking_strategy: strategy,
+                incremental: incremental,
+                clean_sync: cleanSync
             };
+            
+            if (targetFile) {
+                payload.target_file = targetFile;
+            }
 
             if (strategy === 'semantic') {
                 payload.optimize_for_quality = true;
@@ -1296,9 +1339,13 @@
         async function pollIngestionStatus() {
             const progressFill = document.getElementById('ingest-progress-fill');
             const statusEl = document.getElementById('ingest-status');
+            const failedFilesEl = document.getElementById('ingest-failed-files');
 
             if (pollInterval) clearInterval(pollInterval);
 
+            failedFilesEl.style.display = 'none';
+            failedFilesEl.innerHTML = '';
+            
             console.log(`🔄 Starting to poll task: ${currentTaskId}`);
             statusEl.textContent = '⏳ Initializing...';
 
@@ -1319,21 +1366,38 @@
                     const total = data.progress?.total_files || 0;
                     const progressPercent = total > 0 ? Math.round((processed / total) * 100) : 0;
 
+                    // Parse failed files if available
+                    const fileResults = data.file_results || [];
+                    const failedFiles = fileResults.filter(r => !r.success && !r.skipped);
+                    
+                    if (failedFiles.length > 0) {
+                        failedFilesEl.style.display = 'block';
+                        failedFilesEl.innerHTML = `<strong style="color: var(--error); margin-bottom: 4px; display: block;">❌ Failed Files (${failedFiles.length}):</strong>` + 
+                            failedFiles.map(f => `<div style="margin-bottom: 2px;">• <span style="font-family: monospace;">${escapeHtml(f.filename)}</span> 
+                            <span style="color: var(--text-secondary);"> - ${escapeHtml(f.error || 'Unknown error')}</span></div>`).join('');
+                    } else {
+                        failedFilesEl.style.display = 'none';
+                    }
+
                     // Update progress bar
                     progressFill.style.width = progressPercent + '%';
 
                     if (data.status === 'pending') {
                         statusEl.textContent = `⏳ Waiting to start... (${total} files queued)`;
                     } else if (data.status === 'processing') {
-                        statusEl.textContent = `⚙️ Processing: ${processed}/${total} files (${progressPercent}%)`;
+                        const skipped = data.progress?.skipped_files || 0;
+                        const skippedText = skipped > 0 ? ` (⏩ ${skipped} skipped)` : '';
+                        statusEl.textContent = `⚙️ Processing: ${processed}/${total} files (${progressPercent}%)${skippedText}`;
                     } else if (data.status === 'success' || data.status === 'completed') {
                         clearInterval(pollInterval);
                         progressFill.style.width = '100%';
                         const successful = data.progress?.successful_files || 0;
                         const failed = data.progress?.failed_files || 0;
+                        const skipped = data.progress?.skipped_files || 0;
                         const chunks = data.progress?.total_chunks || 0;
-                        statusEl.textContent = `✅ Complete! ${successful} files → ${chunks} chunks (${failed} failed)`;
-                        showAlert('ingest-alert', `Successfully processed ${successful} files (${chunks} chunks)`, 'success');
+                        const skippedText = skipped > 0 ? ` (+ ${skipped} skipped)` : '';
+                        statusEl.textContent = `✅ Complete! ${successful} files processed → ${chunks} chunks${skippedText} (${failed} failed)`;
+                        showAlert('ingest-alert', `Successfully processed ${successful} files (${chunks} chunks)${skippedText}`, 'success');
                         setTimeout(() => loadDashboard(), 2000);
                     } else if (data.status === 'failed') {
                         clearInterval(pollInterval);
@@ -1344,8 +1408,10 @@
                         progressFill.style.width = '100%';
                         const successful = data.progress?.successful_files || 0;
                         const failed = data.progress?.failed_files || 0;
-                        statusEl.textContent = `⚠️ Completed with ${failed} errors (${successful} successful)`;
-                        showAlert('ingest-alert', `Completed with ${failed} errors. ${successful} files processed successfully.`, 'warning');
+                        const skipped = data.progress?.skipped_files || 0;
+                        const skippedText = skipped > 0 ? ` (+ ${skipped} skipped)` : '';
+                        statusEl.textContent = `⚠️ Completed with ${failed} errors (${successful} successful)${skippedText}`;
+                        showAlert('ingest-alert', `Completed with ${failed} errors. ${successful} files processed successfully${skippedText}.`, 'warning');
                     }
                 } catch (error) {
                     console.error('❌ Polling error:', error);

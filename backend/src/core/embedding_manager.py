@@ -63,7 +63,15 @@ class EmbeddingManager:
             "all-minilm": 384,
             "all-minilm:latest": 384,
             "text-embedding-3-small": 1536,
-            "text-embedding-ada-002": 1536
+            "text-embedding-ada-002": 1536,
+            # --- 여기서부터 추가 ---
+            "text-embedding-004": 768,
+            "models/text-embedding-004": 768,
+            "embedding-001": 768,
+            "models/embedding-001": 768,
+            "gemini-embedding-001": 768,
+            "models/gemini-embedding-001": 768
+            # ----------------------
         }
 
         # Initialize provider from config immediately to prevent AttributeError
@@ -83,6 +91,7 @@ class EmbeddingManager:
             "EMBEDDING_PROVIDER": os.getenv("EMBEDDING_PROVIDER", "ollama"),
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
             "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", ""),
+            "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY", ""),  # <--- 이 줄 추가
         }
 
         # Try to load from config_service (if .env file exists)
@@ -189,6 +198,10 @@ class EmbeddingManager:
                 return self._initialize_openai_compatible_embeddings(model, config)
             elif provider.lower() == "huggingface":
                 return self._initialize_huggingface_embeddings(model, config)
+            # --- 여기서부터 추가 ---
+            elif provider.lower() in ["gemini", "google"]:
+                return self._initialize_gemini_embeddings(model, config)
+            # ----------------------
             else:
                 logger.error(f"Unknown embedding provider: {provider}")
                 return None
@@ -299,6 +312,33 @@ class EmbeddingManager:
             return embeddings
         except Exception as e:
             logger.error(f"Failed to initialize HuggingFace embeddings: {e}")
+            return None
+
+    def _initialize_gemini_embeddings(self, model: str, config: Dict) -> Optional[Any]:
+        """Initialize Gemini (Google) embeddings."""
+        try:
+            from llama_index.embeddings.gemini import GeminiEmbedding
+
+            # .env나 시스템 환경변수에서 키를 가져옴
+            api_key = config.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("GOOGLE_API_KEY not found in configuration")
+                return None
+
+            # gemini-embedding-001 입력 시 자동으로 models/gemini-embedding-001 로 변환
+            model_name = f"models/{model}" if not model.startswith("models/") else model
+            
+            embeddings = GeminiEmbedding(
+                model_name=model_name,
+                api_key=api_key
+            )
+            logger.info(f"Gemini embeddings initialized successfully: {model_name}")
+            return embeddings
+        except ImportError:
+            logger.error("Missing package. Run: pip install llama-index-embeddings-gemini")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini embeddings: {e}")
             return None
 
     def _validate_embeddings(self, embeddings: Any) -> bool:

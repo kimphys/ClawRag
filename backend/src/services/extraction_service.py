@@ -17,8 +17,7 @@ from src.models.extraction_result import ExtractionResult as ExtractionResultMod
 from src.models.deduplication_models import DeduplicationPolicy
 from src.services.loaders import code_loader, email_loader, image_loader
 from src.services.deduplication_service import DeduplicationService
-# Assuming docling_loader and docling_service provide a unified interface
-from src.core.docling_loader import DoclingLoader 
+from src.core.docling_loader import DoclingLoaderFactory 
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,6 @@ class ExtractionService:
 
     def __init__(self, db_session: AsyncSession, default_policy: DeduplicationPolicy = DeduplicationPolicy.VERSION):
         self.db = db_session
-        self.docling_loader = DoclingLoader()
         self.deduplication_service = DeduplicationService(db_session)
         self.default_policy = default_policy
 
@@ -136,13 +134,16 @@ class ExtractionService:
         if mime_type in docling_formats:
             extraction_engine = "docling"
             try:
-                # Assuming docling_loader has an async method `extract`
                 loop = asyncio.get_running_loop()
-                docling_result = await loop.run_in_executor(
-                    None, self.docling_loader.extract, file_path
-                )
-                extracted_text = docling_result.get("text")
-                # TODO: Get structured artifacts from docling result
+                loader = DoclingLoaderFactory.create_loader(file_path)
+                docs = await loop.run_in_executor(None, loader.load)
+                
+                if docs and len(docs) > 0:
+                    extracted_text = "\n\n".join([doc.text for doc in docs])
+                    fs_meta.update(docs[0].metadata)
+                else:
+                    extracted_text = ""
+                # Get structured artifacts if provided by metadata later
                 loader_artifacts = {"tables_count": 0, "images_count": 0} 
             except Exception as e:
                 raise ExtractionError(f"Docling extraction failed: {e}", file_path)
@@ -221,31 +222,45 @@ class ExtractionService:
                     f"Engine: {extraction_engine}, Quality: {final_quality_score:.2f}")
 
         # 6. Persist to Database
-        db_meta = ExtractionMetadata(
-            file_hash=file_hash,
-            file_path=file_path,
-            file_name=full_metadata.get("file_name"),
-            file_size=file_size_bytes,
-            mime_type=mime_type,
-            created_date=datetime.fromisoformat(full_metadata.get("created_date")),
-            modified_date=datetime.fromisoformat(full_metadata.get("modified_date")),
-            language=language,
-            structure_score=structure_score,
-            extra={**performance_metrics, **{k: v for k, v in full_metadata.items() if k not in [
+        if duplication_result.is_duplicate and getattr(duplication_result, 'new_metadata_id', None):
+            # The VersionManager already created a new ExtractionMetadata record for this version
+            from sqlalchemy.future import select
+            db_meta = await self.db.get(ExtractionMetadata, duplication_result.new_metadata_id)
+            db_meta.language = language
+            db_meta.structure_score = structure_score
+            db_meta.mime_type = mime_type
+            db_meta.file_size = file_size_bytes
+            db_meta.extra = {**performance_metrics, **{k: v for k, v in full_metadata.items() if k not in [
                 "file_name", "file_size", "created_date", "modified_date", "language", "structure_score", "mime_type"
             ]}}
-        )
+        else:
+            # We are writing a completely new file for the first time
+            db_meta = ExtractionMetadata(
+                file_hash=file_hash,
+                file_path=file_path,
+                file_name=full_metadata.get("file_name"),
+                file_size=file_size_bytes,
+                mime_type=mime_type,
+                created_date=datetime.fromisoformat(full_metadata.get("created_date")),
+                modified_date=datetime.fromisoformat(full_metadata.get("modified_date")),
+                language=language,
+                structure_score=structure_score,
+                extra={**performance_metrics, **{k: v for k, v in full_metadata.items() if k not in [
+                    "file_name", "file_size", "created_date", "modified_date", "language", "structure_score", "mime_type"
+                ]}}
+            )
         
         db_result = ExtractionResultDB(
             extracted_text=extracted_text,
             extraction_engine=extraction_engine,
             text_length=len(extracted_text) if extracted_text else 0,
             quality_score=final_quality_score,
-            metadata=db_meta # Associate with the metadata object
+            extraction_metadata=db_meta # Associate with the metadata object
         )
 
         try:
             self.db.add(db_meta)
+            self.db.add(db_result)
             await self.db.commit()
             await self.db.refresh(db_meta)
             await self.db.refresh(db_result)

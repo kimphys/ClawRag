@@ -60,6 +60,10 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("⚠️  Failed to connect to ChromaDB")
 
+        # Initialize SQLite database
+        from src.database.database import init_db
+        await init_db()
+
         yield  # Application runs here
 
     except Exception as startup_error:

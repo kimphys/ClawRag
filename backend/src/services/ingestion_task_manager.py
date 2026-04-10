@@ -190,8 +190,15 @@ class IngestionTaskManager:
                 self.manager.start_task(task_id)
                 
                 def progress_callback(status):
-                    # This is a simplified callback, real implementation would update task state
-                    pass
+                    if not task:
+                        return
+                    progress_stats = status.get('stats')
+                    if progress_stats:
+                        task.processed_files = progress_stats.get('processed_files', 0)
+                        task.successful_files = progress_stats.get('successful_files', 0)
+                        task.failed_files = progress_stats.get('failed_files', 0)
+                        task.skipped_files = progress_stats.get('skipped_files', 0)
+                        task.total_chunks = progress_stats.get('total_chunks', 0)
                 
                 # Call the real processor
                 result = await self.processor.process(

@@ -41,6 +41,9 @@ class ProcessOptions(BaseModel):
     # Specific parameters for semantic chunking
     semantic_buffer_size: Optional[int] = Field(default=1024, ge=100, le=2048, description="Minimum buffer size for semantic splitting")
     semantic_similarity_threshold: Optional[float] = Field(default=0.7, ge=0.0, le=1.0, description="Similarity threshold for semantic splitting")
+    # Fast incremental sync control
+    force_reingest: bool = Field(default=False, description="Force re-ingestion even if file is unchanged")
+
     
     @field_validator("chunk_overlap")
     @classmethod

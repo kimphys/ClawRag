@@ -29,6 +29,12 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+async def init_db():
+    from src.database.models import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables initialized successfully")
+
 async def get_db():
     """Dependency for getting async database session"""
     async with AsyncSessionLocal() as session:

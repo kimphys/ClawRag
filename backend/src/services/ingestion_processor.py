@@ -69,27 +69,24 @@ class IngestionProcessor:
         # Initialize retry policy if enabled
         retry_policy = INGESTION_RETRY if use_retry_policy else None
 
-        # Concurrency control: max 5 files in parallel
-        semaphore = asyncio.Semaphore(5)
+        # Concurrency control: max 2 files in parallel (was 5)
+        semaphore = asyncio.Semaphore(2)
 
         try:
             if not assignments:
                 return {'success': False, 'error': 'No file assignments found'}
 
-            # Process all files in parallel
-            file_results = await asyncio.gather(
-                *[self._process_single_file(
-                    assignment, 
-                    collection_name, 
-                    rag_client, 
-                    semaphore, 
-                    retry_policy
-                  ) for assignment in assignments],
-                return_exceptions=False
-            )
+            # Process all files in parallel with live progress updates
+            tasks = [asyncio.create_task(self._process_single_file(
+                assignment, 
+                collection_name, 
+                rag_client, 
+                semaphore, 
+                retry_policy
+            )) for assignment in assignments]
 
-            # Aggregate results
-            for result in file_results:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
                 stats['processed_files'] += 1
                 stats['file_results'].append(result)
                 
@@ -108,8 +105,11 @@ class IngestionProcessor:
                         'progress': progress,
                         'processed': stats['processed_files'],
                         'total': total_files,
-                        'current_file': result.filename
+                        'current_file': result.filename,
+                        'stats': stats
                     })
+            
+            file_results = stats['file_results']
 
             # Phase 8e: Register collections in registry (graceful degradation)
             if stats['successful_files'] > 0:
@@ -185,9 +185,21 @@ class IngestionProcessor:
 
                     # 2. Call Extraction Service
                     try:
+                        from src.models.deduplication_models import DeduplicationPolicy
+                        
+                        # Determine policy based on ProcessOptions
+                        policy = DeduplicationPolicy.SKIP
+                        if process_options_data and isinstance(process_options_data, dict):
+                            if process_options_data.get('force_reingest'):
+                                policy = DeduplicationPolicy.VERSION
+                        elif process_options_data and hasattr(process_options_data, 'force_reingest'):
+                            if process_options_data.force_reingest:
+                                policy = DeduplicationPolicy.VERSION
+                                
                         extraction_result = await extraction_svc.extract_document(
                             file_path=file_path,
-                            original_filename=filename
+                            original_filename=filename,
+                            policy=policy
                         )
                     except ExtractionError as e:
                         if "Duplicate file" in str(e):
@@ -210,16 +222,39 @@ class IngestionProcessor:
                             doc_id=extraction_result.file_hash
                         )
 
-                        indexing_response = await indexing_svc.index_documents(
-                            documents=[doc_to_index],
-                            collection_name=target_collection,
-                            chunk_config=chunk_config # Pass the custom config
-                        )
-
-                        if indexing_response.status != "SUCCESS":
-                            raise Exception(f"Indexing failed: {indexing_response.error}")
+                        # Exponential backoff retry logic for indexing
+                        max_retries = 3
+                        base_delay = 5.0
+                        indexing_response = None
+                        
+                        for attempt in range(max_retries):
+                            try:
+                                indexing_response = await indexing_svc.index_documents(
+                                    documents=[doc_to_index],
+                                    collection_name=target_collection,
+                                    chunk_config=chunk_config # Pass the custom config
+                                )
+                                
+                                if not indexing_response.is_success:
+                                    raise Exception(f"Indexing failed: {indexing_response.error}")
+                                
+                                break # Success, break out of retry loop
+                                
+                            except Exception as e:
+                                error_msg = str(e)
+                                if "429" in error_msg or "quota" in error_msg.lower() or "too many" in error_msg.lower() or "rate limit" in error_msg.lower():
+                                    if attempt < max_retries - 1:
+                                        delay = base_delay * (2 ** attempt)
+                                        self.logger.warning(f"Rate limit hit for {filename}. Retrying in {delay}s (Attempt {attempt+1}/{max_retries})...")
+                                        await asyncio.sleep(delay)
+                                        continue
+                                # If we exhaust retries or it's not a rate limit error, raise it
+                                raise e
 
                         total_chunks = indexing_response.data.get("indexed_nodes", 0)
+                        
+                        # Add a mandatory sleep to prevent bursting API requests even if successful
+                        await asyncio.sleep(1.0)
                         
                         return FileResult(
                             file_path=file_path,

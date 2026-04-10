@@ -30,6 +30,8 @@ llama-index-embeddings-ollama
 llama-index-vector-stores-chroma
 llama-index-llms-ollama
 llama-index-llms-openai-like
+llama-index-llms-gemini
+llama-index-embeddings-gemini
 
 # Retrieval enhancements
 rank_bm25
